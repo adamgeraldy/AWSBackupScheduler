@@ -1,0 +1,489 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BackupSchedulerLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: BackupSchedulerLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - dynamodb:*
+              Resource: "arn:aws:dynamodb:*:*:table/BackupScheduler"
+            - Effect: Allow
+              Action:
+              - logs:*
+              Resource: "*"
+            - Effect: Allow
+              Action:
+              - ec2:DeregisterImage
+              - ec2:DescribeInstances
+              - ec2:DescribeImages
+              - ec2:DeleteSnapshot
+              - ec2:DeleteTags
+              - ec2:CreateTags
+              - ec2:CreateSnapshot
+              - ec2:CreateImage
+              - ec2:DescribeSnapshots
+              - rds:DescribeDBInstances
+              - rds:DescribeDBSnapshots
+              - rds:CreateDBSnapshot
+              - rds:DeleteDBSnapshot
+              - rds:ListTagsForResource
+              - rds:AddTagsToResource
+              Resource: "*"
+  Ec2BackupLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime, timedelta
+          from boto3.dynamodb.conditions import Key
+          import dateutil.tz
+
+          def lambda_handler(event, context):
+              timestamp = int(datetime.now().timestamp())
+              dynamodb = boto3.resource("dynamodb")
+
+              table = dynamodb.Table("BackupScheduler")
+              
+              ## EC2 SECTION ##
+              response = table.query(
+                  KeyConditionExpression=Key("resourceType").eq("ec2ami")
+              )
+              result = response["Items"]
+              ec2 = boto3.client("ec2")
+              for res in result:
+                  localTime = dateutil.tz.gettz(res["timezone"])
+                  curLocalHour = datetime.now(tz=localTime).hour
+                  if(res["backupWindowStart"] <= curLocalHour and curLocalHour <= res["backupWindowEnd"]):
+                      if(res["nextExecution"] < timestamp or res["nextExecution"] == 0):
+                          custom_filter = [{"Name":"tag:BackupScheduler", "Values": [res["resourceTag"]]}]
+                          response = ec2.describe_instances(Filters=custom_filter)
+                          if(len(response["Reservations"]) < 1):
+                              continue
+                          instances = response["Reservations"][0]["Instances"]
+                          for instance in instances:
+                              name_format = instance["InstanceId"] + "_" + str(timestamp)
+                              try:
+                                  retainMultiplier = (1 if res["retainUnit"] == "hours" else 24)
+                                  delete_by = int((datetime.now() + timedelta(hours=int(retainMultiplier * res["retainNumber"]))).timestamp())
+                                  ec2.create_image(
+                                      InstanceId=instance["InstanceId"], 
+                                      Name=name_format, 
+                                      Description=str(delete_by),
+                                      # DryRun=True,
+                                      NoReboot=(False if res["withReboot"] == "yes" else True),
+                                      TagSpecifications=[
+                                          {
+                                              "ResourceType": "image",
+                                              "Tags": [
+                                                  {
+                                                      "Key": "Name",
+                                                      "Value": "Backup_" + instance["InstanceId"]
+                                                  },
+                                                  {
+                                                      "Key": "BackupScheduler",
+                                                      "Value": res["resourceTag"]
+                                                  },
+                                                  {
+                                                      "Key": "BackupDeleteBy",
+                                                      "Value": str(delete_by)
+                                                  }
+                                              ]
+                                          },
+                                          {
+                                              "ResourceType": "snapshot",
+                                              "Tags": [
+                                                  {
+                                                      "Key": "Name",
+                                                      "Value": "Backup_" + instance["InstanceId"]
+                                                  },
+                                                  {
+                                                      "Key": "BackupScheduler",
+                                                      "Value": res["resourceTag"]
+                                                  }
+                                              ]
+                                          },
+                                      ]
+                                  )
+                              except:
+                                  continue
+                                  ## NEED TO DO SOME ERROR LOG PROCESSING HERE
+                              update_next_execution(table, res)
+          def update_next_execution(table, res):
+              hourMultiplier = (1 if res["frequencyUnit"] == "hours" else 24)
+              _ = table.update_item(
+                  Key={
+                      "resourceType": res["resourceType"],
+                      "resourceTag": res["resourceTag"]
+                  },
+                  UpdateExpression="set nextExecution=:ne",
+                  ExpressionAttributeValues={
+                      ":ne": int((datetime.now() + timedelta(hours=int(hourMultiplier * res["frequencyNumber"]-1), minutes=59)).timestamp())
+                  }
+              )
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt: [ LambdaRole , "Arn" ]
+      Runtime: python3.7
+      Timeout: 60
+  RdsBackupLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime, timedelta
+          from boto3.dynamodb.conditions import Key
+          import dateutil.tz
+
+          def lambda_handler(event, context):
+              timestamp = int(datetime.now().timestamp())
+              dynamodb = boto3.resource("dynamodb")
+
+              table = dynamodb.Table("BackupScheduler")
+              
+              ## RDS SECTION ##
+              rds = boto3.client("rds")
+              db_instances = rds.describe_db_instances()
+              for instance in db_instances["DBInstances"]:
+                  for tag in instance["TagList"]:
+                      if(tag["Key"] == "BackupScheduler"):
+                          response = table.query(
+                              KeyConditionExpression=
+                                  Key('resourceType').eq("rds") & Key('resourceTag').eq(tag["Value"])
+                          )
+                          if(len(response["Items"]) > 0):
+                              res = response["Items"][0]
+                              localTime = dateutil.tz.gettz(res["timezone"])
+                              curLocalHour = datetime.now(tz=localTime).hour
+                              if(res["backupWindowStart"] <= curLocalHour and curLocalHour <= res["backupWindowEnd"]):
+                                  if(res["nextExecution"] < timestamp or res["nextExecution"] == 0):
+                                      retainMultiplier = (1 if res["retainUnit"] == "hours" else 24)
+                                      delete_by = int((datetime.now() + timedelta(hours=int(retainMultiplier * res["retainNumber"]))).timestamp())
+                                      name_format = "backupscheduler-" + instance["DBInstanceIdentifier"] + "-" + str(delete_by)
+                                      try:
+                                          rds.create_db_snapshot(
+                                              DBSnapshotIdentifier=name_format,
+                                              DBInstanceIdentifier=instance["DBInstanceIdentifier"],
+                                              Tags=[
+                                                  {
+                                                      "Key": "BackupScheduler",
+                                                      "Value": res["resourceTag"]
+                                                  },
+                                                  {
+                                                      "Key": "BackupDeleteBy",
+                                                      "Value": str(delete_by)
+                                                  },
+                                                  {
+                                                      "Key": "BackupTime",
+                                                      "Value": str(timestamp)
+                                                  }
+                                              ]
+                                          )
+                                      except:
+                                          continue
+                                  update_next_execution(table, res)
+          def update_next_execution(table, res):
+              hourMultiplier = (1 if res["frequencyUnit"] == "hours" else 24)
+              _ = table.update_item(
+                  Key={
+                      "resourceType": res["resourceType"],
+                      "resourceTag": res["resourceTag"]
+                  },
+                  UpdateExpression="set nextExecution=:ne",
+                  ExpressionAttributeValues={
+                      ":ne": int((datetime.now() + timedelta(hours=int(hourMultiplier * res["frequencyNumber"]-1), minutes=59)).timestamp())
+                  }
+              )
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt: [ LambdaRole , "Arn" ]
+      Runtime: python3.7
+      Timeout: 60
+  BackupCleanupLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime, timedelta
+          from boto3.dynamodb.conditions import Key
+          import dateutil.tz
+
+          def lambda_handler(event, context):
+              timestamp = int(datetime.now().timestamp())
+              dynamodb = boto3.resource('dynamodb')
+
+              table = dynamodb.Table('BackupScheduler')
+              
+              ## EC2 AMI AND SNAPSHOT CLEANUP
+              ec2 = boto3.client('ec2')
+              amis = ec2.describe_images(Filters=[
+                  {
+                      'Name': 'tag-key',
+                      'Values': ['BackupDeleteBy']
+                  }
+              ])
+
+              for ami in amis["Images"]:
+                  try:
+                      delete_by = ami["Description"]
+                      if(timestamp > int(delete_by)):
+                          # Deregister AMI
+                          ec2.deregister_image(ImageId=ami["ImageId"])
+                          for snap in ami["BlockDeviceMappings"]:
+                              # Delete snapshots
+                              ec2.delete_snapshot(SnapshotId=snap["Ebs"]["SnapshotId"])
+                  except:
+                      print("ERROR DELETING AMIS AND SNAPSHOTS")
+                      
+                      
+              ## RDS SECTION
+              rds = boto3.client('rds')
+              snapshots = rds.describe_db_snapshots(
+                  SnapshotType="manual"
+              )
+              for snapshot in snapshots["DBSnapshots"]:
+                  if(snapshot["DBSnapshotIdentifier"].startswith("backupscheduler")):
+                      try:
+                          delete_by = int(snapshot["DBSnapshotIdentifier"].split("-")[-1])
+                          if(timestamp > delete_by):
+                              rds.delete_db_snapshot(DBSnapshotIdentifier=snapshot["DBSnapshotIdentifier"])
+                      except:
+                          continue
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt: [ LambdaRole , "Arn" ]
+      Runtime: python3.7
+      Timeout: 60
+  InitFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          def lambda_handler(event, context):              
+              items = [
+                  {
+                    "resourceType": "ec2ami",
+                    "resourceTag": "hourly-backup-1-day-retain",
+                    "frequencyUnit": "hours",
+                    "nextExecution": 0,
+                    "backupWindowEnd": 24,
+                    "backupWindowStart": 0,
+                    "timezone": "Asia/Jakarta",
+                    "withReboot": "yes",
+                    "retainNumber": 1,
+                    "retainUnit": "days",
+                    "frequencyNumber": 1
+                  },
+                  {
+                    "resourceType": "ec2ami",
+                    "resourceTag": "4-hourly-backup-2-day-retain",
+                    "frequencyUnit": "hours",
+                    "nextExecution": 0,
+                    "backupWindowEnd": 24,
+                    "backupWindowStart": 0,
+                    "timezone": "Asia/Jakarta",
+                    "withReboot": "yes",
+                    "retainNumber": 2,
+                    "retainUnit": "days",
+                    "frequencyNumber": 4
+                  },
+                  {
+                    "resourceType": "ec2ami",
+                    "resourceTag": "daily-backup-7-day-retain",
+                    "frequencyUnit": "days",
+                    "nextExecution": 0,
+                    "backupWindowEnd": 2,
+                    "backupWindowStart": 0,
+                    "timezone": "Asia/Jakarta",
+                    "withReboot": "yes",
+                    "retainNumber": 7,
+                    "retainUnit": "days",
+                    "frequencyNumber": 1
+                  },
+                  {
+                    "resourceType": "ec2ami",
+                    "resourceTag": "daily-backup-30-day-retain",
+                    "frequencyUnit": "days",
+                    "nextExecution": 0,
+                    "backupWindowEnd": 2,
+                    "backupWindowStart": 0,
+                    "timezone": "Asia/Jakarta",
+                    "withReboot": "yes",
+                    "retainNumber": 30,
+                    "retainUnit": "days",
+                    "frequencyNumber": 1
+                  },
+                  {
+                    "resourceType": "ec2ami",
+                    "resourceTag": "hourly-backup-1-hour-retain",
+                    "frequencyUnit": "hours",
+                    "nextExecution": 0,
+                    "backupWindowEnd": 24,
+                    "backupWindowStart": 0,
+                    "timezone": "Asia/Jakarta",
+                    "withReboot": "yes",
+                    "retainNumber": 1,
+                    "retainUnit": "hours",
+                    "frequencyNumber": 1
+                  },
+                  {
+                    "resourceType": "ec2ami",
+                    "resourceTag": "4-hourly-backup-2-day-retain",
+                    "frequencyUnit": "hours",
+                    "nextExecution": 0,
+                    "backupWindowEnd": 24,
+                    "backupWindowStart": 0,
+                    "timezone": "Asia/Jakarta",
+                    "withReboot": "yes",
+                    "retainNumber": 2,
+                    "retainUnit": "days",
+                    "frequencyNumber": 4
+                  },
+                  {
+                    "resourceType": "rds",
+                    "resourceTag": "daily-backup-7-day-retain",
+                    "frequencyUnit": "days",
+                    "nextExecution": 0,
+                    "backupWindowEnd": 2,
+                    "backupWindowStart": 0,
+                    "timezone": "Asia/Jakarta",
+                    "withReboot": "yes",
+                    "retainNumber": 7,
+                    "retainUnit": "days",
+                    "frequencyNumber": 1
+                  },
+                  {
+                    "resourceType": "rds",
+                    "resourceTag": "daily-backup-30-day-retain",
+                    "frequencyUnit": "days",
+                    "nextExecution": 0,
+                    "backupWindowEnd": 2,
+                    "backupWindowStart": 0,
+                    "timezone": "Asia/Jakarta",
+                    "withReboot": "yes",
+                    "retainNumber": 30,
+                    "retainUnit": "days",
+                    "frequencyNumber": 1
+                  }
+              ]
+              
+              dynamodb = boto3.resource("dynamodb")
+              table = dynamodb.Table("BackupScheduler")
+              for item in items:
+                  response = table.put_item(
+                    Item=item
+                  )
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt: [ LambdaRole , "Arn" ]
+      Runtime: python3.7
+      Timeout: 60
+  DynamoDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: BackupScheduler        
+      AttributeDefinitions: 
+        - AttributeName: resourceType
+          AttributeType: S
+        - AttributeName: resourceTag
+          AttributeType: S
+      KeySchema:
+        - AttributeName: resourceType
+          KeyType: HASH
+        - AttributeName: resourceTag
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+  InitializeDynamoDB:
+    Type: Custom::InitFunction
+    DependsOn: DynamoDB
+    Properties:
+      ServiceToken:
+         Fn::GetAtt: [ InitFunction , "Arn" ]
+      DynamoTableName:
+        Ref: DynamoDB
+  
+  ScheduledRule: 
+    Type: AWS::Events::Rule
+    Properties:
+      Name: backup-scheduler-rule
+      Description: "Scheduler rule for automatic backup"
+      ScheduleExpression: "rate(1 minute)"
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "Ec2BackupLambda"
+              - "Arn"
+          Id: "Ec2Backup"
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "RdsBackupLambda"
+              - "Arn"
+          Id: "RdsBackup"
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "BackupCleanupLambda"
+              - "Arn"
+          Id: "BackupCleanup"
+  Ec2TriggerPermission: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "Ec2BackupLambda"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "ScheduledRule"
+          - "Arn"
+  RdsTriggerPermission: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "RdsBackupLambda"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "ScheduledRule"
+          - "Arn"
+  BackupCleanupTriggerPermission: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "BackupCleanupLambda"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "ScheduledRule"
+          - "Arn"
+
+
