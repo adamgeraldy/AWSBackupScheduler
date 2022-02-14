@@ -338,19 +338,6 @@ Resources:
                     "frequencyNumber": 1
                   },
                   {
-                    "resourceType": "ec2ami",
-                    "resourceTag": "4-hourly-backup-2-day-retain",
-                    "frequencyUnit": "hours",
-                    "nextExecution": 0,
-                    "backupWindowEnd": 24,
-                    "backupWindowStart": 0,
-                    "timezone": "Asia/Jakarta",
-                    "withReboot": "yes",
-                    "retainNumber": 2,
-                    "retainUnit": "days",
-                    "frequencyNumber": 4
-                  },
-                  {
                     "resourceType": "rds",
                     "resourceTag": "half-daily-backup-7-day-retain",
                     "frequencyUnit": "hours",
