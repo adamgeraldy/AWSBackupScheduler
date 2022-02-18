@@ -125,7 +125,7 @@ Resources:
                               except:
                                   continue
                                   ## NEED TO DO SOME ERROR LOG PROCESSING HERE
-                              update_next_execution(table, res)
+                          update_next_execution(table, res)
           def update_next_execution(table, res):
               hourMultiplier = (1 if res["frequencyUnit"] == "hours" else 24)
               _ = table.update_item(
